@@ -17,9 +17,9 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, parse_qs
 
-# =========================
+
 # CONFIG
-# =========================
+
 load_dotenv()
 API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_BASE = "https://api.groq.com/openai/v1"
