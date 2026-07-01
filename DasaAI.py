@@ -1,5 +1,4 @@
 import streamlit as st
-from openai import OpenAI
 from dotenv import load_dotenv
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
@@ -23,23 +22,34 @@ from urllib.parse import urlparse, parse_qs
 # =========================
 load_dotenv()
 API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_BASE = "https://api.groq.com/openai/v1"
 
-client = OpenAI(
-    api_key=API_KEY,
-    base_url="https://api.groq.com/openai/v1"
-)
+def groq_request(messages, model="llama-3.1-8b-instant", stream=False, max_tokens=2048, system=None):
+    """Core Groq API call using requests — no OpenAI SDK needed."""
+    all_messages = []
+    if system:
+        all_messages.append({"role": "system", "content": system})
+    all_messages.extend(messages)
+    
+    payload = {
+        "model": model,
+        "messages": all_messages,
+        "max_tokens": max_tokens,
+        "stream": stream,
+    }
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json",
+    }
+    response = requests.post(f"{GROQ_BASE}/chat/completions", json=payload, headers=headers, stream=stream, timeout=60)
+    response.raise_for_status()
+    return response
 
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 
 # =========================
 # PRIVATE / RESTRICTED DATA
 # =========================
-PRIVATE_DATA = {
-    "phone": True, "email": True, "address": True,
-    "password": True, "api_key": True, "salary": True,
-    "bank": True, "nid": True, "passport": True,
-}
-
 HARMFUL_PATTERNS = [
     r"\b(kill|murder|suicide|self.harm|harm myself|end my life|want to die|how to die)\b",
     r"\b(bomb|explosive|weapon|gun|knife to hurt)\b",
@@ -102,7 +112,6 @@ def get_youtube_video_id(url):
     return qs.get("v", [None])[0]
 
 def fetch_youtube_info(url):
-    """Fetch YouTube page metadata via scraping (no API key needed)."""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
         r = requests.get(url, headers=headers, timeout=10)
@@ -120,50 +129,29 @@ def fetch_youtube_info(url):
         return {"title": "Could not fetch", "description": str(e), "keywords": "", "channel": "", "url": url}
 
 def fetch_website_content(url):
-    """Scrape general website content for analysis."""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
         r = requests.get(url, headers=headers, timeout=12)
         soup = BeautifulSoup(r.text, "html.parser")
-
-        # Remove scripts/styles
         for tag in soup(["script", "style", "nav", "footer"]):
             tag.decompose()
-
         title = soup.title.text.strip() if soup.title else "No Title"
         meta_desc = soup.find("meta", {"name": "description"})
         meta_desc = meta_desc.get("content", "") if meta_desc else ""
-
-        # Grab headings and paragraphs
         headings = [h.text.strip() for h in soup.find_all(["h1", "h2", "h3"])[:15]]
         paragraphs = [p.text.strip() for p in soup.find_all("p")[:20] if len(p.text.strip()) > 40]
         links = list(set([a.get("href", "") for a in soup.find_all("a", href=True) if a.get("href", "").startswith("http")][:20]))
-
-        # Detect technologies / social proof signals
         text_lower = r.text.lower()
         tech_signals = {
-            "React": "react" in text_lower,
-            "Next.js": "next.js" in text_lower or "_next" in text_lower,
-            "Vue": "vue" in text_lower,
-            "Tailwind": "tailwind" in text_lower,
-            "GitHub": "github" in text_lower,
-            "LinkedIn": "linkedin" in text_lower,
-            "Contact Form": "contact" in text_lower,
-            "Projects Section": "project" in text_lower,
+            "React": "react" in text_lower, "Next.js": "next.js" in text_lower or "_next" in text_lower,
+            "Vue": "vue" in text_lower, "Tailwind": "tailwind" in text_lower,
+            "GitHub": "github" in text_lower, "LinkedIn": "linkedin" in text_lower,
+            "Contact Form": "contact" in text_lower, "Projects Section": "project" in text_lower,
             "Blog": "blog" in text_lower,
         }
         detected_tech = [k for k, v in tech_signals.items() if v]
-
-        return {
-            "title": title,
-            "meta_desc": meta_desc,
-            "headings": headings,
-            "paragraphs": paragraphs[:8],
-            "links": links[:10],
-            "detected_tech": detected_tech,
-            "url": url,
-            "status": r.status_code
-        }
+        return {"title": title, "meta_desc": meta_desc, "headings": headings, "paragraphs": paragraphs[:8],
+                "links": links[:10], "detected_tech": detected_tech, "url": url, "status": r.status_code}
     except Exception as e:
         return {"title": "Error", "meta_desc": str(e), "headings": [], "paragraphs": [], "links": [], "detected_tech": [], "url": url, "status": 0}
 
@@ -200,57 +188,89 @@ def search(query):
     _, I = st.session_state.index.search(q, 3)
     return "\n".join([st.session_state.chunks[i] for i in I[0]])
 
-def groq_chat(prompt, system="You are a helpful, smart, and friendly AI assistant.", stream=True):
-    res = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt}
-        ],
-        stream=stream
+def groq_chat_no_stream(prompt, system="You are a helpful AI assistant.", model="llama-3.1-8b-instant"):
+    """Non-streaming Groq chat — returns text string."""
+    resp = groq_request(
+        messages=[{"role": "user", "content": prompt}],
+        model=model,
+        system=system,
+        stream=False,
     )
-    return res
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
 
-def groq_chat_no_stream(prompt, system="You are a helpful AI assistant."):
-    res = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt}
-        ],
-        stream=False
+def groq_chat_stream(prompt, system="You are a helpful, frank, and friendly AI."):
+    """Streaming Groq chat — yields text chunks."""
+    resp = groq_request(
+        messages=[{"role": "user", "content": prompt}],
+        system=system,
+        stream=True,
     )
-    return res.choices[0].message.content
+    for line in resp.iter_lines():
+        if line:
+            line = line.decode("utf-8")
+            if line.startswith("data: "):
+                chunk_data = line[6:]
+                if chunk_data.strip() == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(chunk_data)
+                    delta = obj["choices"][0]["delta"].get("content", "")
+                    if delta:
+                        yield delta
+                except Exception:
+                    continue
+
+def stream_response(prompt, system="You are a helpful, frank, and friendly AI."):
+    """Stream response into a Streamlit placeholder."""
+    box = st.empty()
+    out = ""
+    for chunk in groq_chat_stream(prompt, system=system):
+        out += chunk
+        box.markdown(out + "▌")
+        time.sleep(0.005)
+    box.markdown(out)
+    return out
+
+def groq_vision_chat(prompt, img_b64, model="llama-3.2-11b-vision-preview"):
+    """Vision model call with base64 image."""
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
+                {"type": "text", "text": prompt}
+            ]
+        }],
+        "max_tokens": 1000,
+    }
+    resp = requests.post(f"{GROQ_BASE}/chat/completions", json=payload, headers=headers, timeout=60)
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
 
 def get_download_link(content, filename, label, mime="text/plain"):
     b64 = base64.b64encode(content.encode()).decode()
     return f'<a href="data:{mime};base64,{b64}" download="{filename}" style="display:inline-block;padding:8px 18px;background:linear-gradient(90deg,#6366f1,#8b5cf6);color:white;border-radius:8px;text-decoration:none;font-weight:600;margin-top:10px;">⬇️ {label}</a>'
 
-def stream_response(prompt, system="You are a helpful, frank, and friendly AI."):
-    box = st.empty()
-    out = ""
-    for r in groq_chat(prompt, system=system, stream=True):
-        if r.choices[0].delta.content:
-            out += r.choices[0].delta.content
-            box.markdown(out + "▌")
-            time.sleep(0.01)
-    box.markdown(out)
-    return out
-
 # =========================
 # UI CONFIG
 # =========================
-st.set_page_config(page_title="⚔️ Guardian AI", layout="wide", page_icon="⚔️")
+st.set_page_config(page_title="⚔️ DASA Studio AI", layout="wide", page_icon="⚔️")
 
 THEMES = {
-    "🌌 Cyber Dark": {"bg": "#0a0a0f", "card": "#13131a", "accent": "#6366f1", "accent2": "#8b5cf6", "text": "#e2e8f0", "sub": "#94a3b8"},
-    "🌊 Ocean Blue": {"bg": "#0c1a2e", "card": "#0f2744", "accent": "#38bdf8", "accent2": "#0ea5e9", "text": "#e0f2fe", "sub": "#7dd3fc"},
-    "🌿 Matrix Green": {"bg": "#0a1a0a", "card": "#0f2010", "accent": "#22c55e", "accent2": "#16a34a", "text": "#dcfce7", "sub": "#86efac"},
-    "🔥 Red Neon": {"bg": "#150a0a", "card": "#200f0f", "accent": "#ef4444", "accent2": "#dc2626", "text": "#fee2e2", "sub": "#fca5a5"},
-    "💜 Purple Haze": {"bg": "#0f0a1a", "card": "#180f2a", "accent": "#a855f7", "accent2": "#9333ea", "text": "#f3e8ff", "sub": "#d8b4fe"},
-    "🌸 Pink Dream": {"bg": "#1a0a12", "card": "#2a0f1c", "accent": "#ec4899", "accent2": "#db2777", "text": "#fce7f3", "sub": "#f9a8d4"},
-    "🌙 Midnight": {"bg": "#060612", "card": "#0d0d1f", "accent": "#818cf8", "accent2": "#6366f1", "text": "#eef2ff", "sub": "#a5b4fc"},
-    "🟠 Orange Flame": {"bg": "#150a00", "card": "#211000", "accent": "#f97316", "accent2": "#ea580c", "text": "#fff7ed", "sub": "#fdba74"},
+    "🌌 Cyber Dark":    {"bg": "#0a0a0f", "card": "#13131a", "accent": "#6366f1", "accent2": "#8b5cf6", "text": "#e2e8f0", "sub": "#94a3b8"},
+    "🌊 Ocean Blue":    {"bg": "#0c1a2e", "card": "#0f2744", "accent": "#38bdf8", "accent2": "#0ea5e9", "text": "#e0f2fe", "sub": "#7dd3fc"},
+    "🌿 Matrix Green":  {"bg": "#0a1a0a", "card": "#0f2010", "accent": "#22c55e", "accent2": "#16a34a", "text": "#dcfce7", "sub": "#86efac"},
+    "🔥 Red Neon":      {"bg": "#150a0a", "card": "#200f0f", "accent": "#ef4444", "accent2": "#dc2626", "text": "#fee2e2", "sub": "#fca5a5"},
+    "💜 Purple Haze":   {"bg": "#0f0a1a", "card": "#180f2a", "accent": "#a855f7", "accent2": "#9333ea", "text": "#f3e8ff", "sub": "#d8b4fe"},
+    "🌸 Pink Dream":    {"bg": "#1a0a12", "card": "#2a0f1c", "accent": "#ec4899", "accent2": "#db2777", "text": "#fce7f3", "sub": "#f9a8d4"},
+    "🌙 Midnight":      {"bg": "#060612", "card": "#0d0d1f", "accent": "#818cf8", "accent2": "#6366f1", "text": "#eef2ff", "sub": "#a5b4fc"},
+    "🟠 Orange Flame":  {"bg": "#150a00", "card": "#211000", "accent": "#f97316", "accent2": "#ea580c", "text": "#fff7ed", "sub": "#fdba74"},
 }
 
 if "theme" not in st.session_state:
@@ -372,7 +392,6 @@ section[data-testid="stSidebar"] * {{
     margin: 8px 0 8px 60px;
     color: {T['text']};
     font-size: 0.95rem;
-    position: relative;
     animation: slideInRight 0.3s ease;
 }}
 
@@ -384,7 +403,6 @@ section[data-testid="stSidebar"] * {{
     margin: 8px 60px 8px 0;
     color: {T['text']};
     font-size: 0.95rem;
-    position: relative;
     animation: slideInLeft 0.3s ease;
 }}
 
@@ -400,7 +418,6 @@ section[data-testid="stSidebar"] * {{
     from {{ transform: translateX(20px); opacity: 0; }}
     to {{ transform: translateX(0); opacity: 1; }}
 }}
-
 @keyframes slideInLeft {{
     from {{ transform: translateX(-20px); opacity: 0; }}
     to {{ transform: translateX(0); opacity: 1; }}
@@ -611,10 +628,6 @@ code {{
     color: {T['accent']};
     font-weight: 700;
 }}
-
-.stSpinner > div {{
-    border-color: {T['accent']} transparent transparent !important;
-}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -626,7 +639,7 @@ now = datetime.datetime.now().strftime("%H:%M  |  %d %b %Y")
 st.markdown(f"""
 <div class="navbar">
     <div>
-        <div class="navbar-title">⚔️ DASA STUDIO AI </div>
+        <div class="navbar-title">⚔️ DASA STUDIO AI</div>
         <div style="color:{T['sub']};font-size:0.8rem;margin-top:4px;font-family:'Inter',sans-serif;">
             Intelligent · Restricted · Futuristic
         </div>
@@ -634,7 +647,7 @@ st.markdown(f"""
     <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
         <span class="badge-online">ONLINE</span>
         <span class="navbar-badge">LLaMA-3.1</span>
-        <span class="navbar-badge">DASA</span>
+        <span class="navbar-badge">GROQ</span>
         <span class="navbar-time">{now}</span>
     </div>
 </div>
@@ -666,12 +679,12 @@ st.sidebar.markdown(f"""
 • Private data protected<br>
 • Harmful content blocked<br>
 • Crisis detection active<br>
-• Code/data locked
+• Powered by Groq API
 </div>
 """, unsafe_allow_html=True)
 
 st.sidebar.markdown("---")
-st.sidebar.markdown(f"<div style='color:{T['sub']};font-size:0.72rem;text-align:center;font-family:JetBrains Mono,monospace;'>Guardian AI v2.1 • Built by You</div>", unsafe_allow_html=True)
+st.sidebar.markdown(f"<div style='color:{T['sub']};font-size:0.72rem;text-align:center;font-family:JetBrains Mono,monospace;'>Guardian AI v2.1 • DASA Studio</div>", unsafe_allow_html=True)
 
 # =========================
 # SESSION INIT
@@ -689,7 +702,7 @@ if "blocked_count" not in st.session_state:
 # 🧠 CHATBOT
 # =========================
 if menu == "🧠 Chatbot":
-    st.markdown('<div class="section-title">🧠 DASA CHATBOT </div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">🧠 DASA CHATBOT</div>', unsafe_allow_html=True)
 
     col1, col2 = st.columns([2, 1])
 
@@ -713,7 +726,7 @@ if menu == "🧠 Chatbot":
         </div>
         """, unsafe_allow_html=True)
 
-        file = st.file_uploader("📎 Upload PDF ", type=["pdf"])
+        file = st.file_uploader("📎 Upload PDF", type=["pdf"])
         if file and st.button("⚡ Process PDF"):
             with st.spinner("Embedding PDF..."):
                 text = load_pdf(file)
@@ -732,11 +745,10 @@ if menu == "🧠 Chatbot":
                 f"[{m['role'].upper()}] {m['time']}\n{m['msg']}"
                 for m in st.session_state.chat_history
             ])
-            st.markdown(get_download_link(chat_export, "guardian_chat.txt", "Download Chat"), unsafe_allow_html=True)
+            st.markdown(get_download_link(chat_export, "dasa_chat.txt", "Download Chat"), unsafe_allow_html=True)
 
     with col1:
-        chat_container = st.container()
-        with chat_container:
+        with st.container():
             if not st.session_state.chat_history:
                 st.markdown(f"""
                 <div style="text-align:center;padding:40px;color:{T['sub']};">
@@ -833,25 +845,13 @@ elif menu == "📄 CV Maker":
             if not name:
                 st.warning("Please enter your name.")
             else:
-                prompt = f"""
-Create a {template} style professional CV.
-
-Name: {name}
-Title: {title}
-Email: {email_cv}
-Phone: {phone_cv}
-Skills: {skills}
-Experience: {experience}
-Education: {education}
-Projects: {projects}
-Career Goal: {goal}
-Languages: {languages}
-
-Format it with clear sections, bullet points, and make it ATS-friendly and impressive.
-"""
+                prompt = f"""Create a {template} style professional CV.
+Name: {name} | Title: {title} | Email: {email_cv} | Phone: {phone_cv}
+Skills: {skills} | Experience: {experience} | Education: {education}
+Projects: {projects} | Career Goal: {goal} | Languages: {languages}
+Format with clear sections, bullet points, ATS-friendly and impressive."""
                 with st.spinner("Crafting your CV..."):
                     result = groq_chat_no_stream(prompt, system="You are a professional CV writer. Create polished, modern CVs.")
-
                 st.markdown(f'<div class="g-card">', unsafe_allow_html=True)
                 st.markdown(result)
                 st.markdown('</div>', unsafe_allow_html=True)
@@ -862,11 +862,8 @@ Format it with clear sections, bullet points, and make it ATS-friendly and impre
 # =========================
 elif menu == "🌍 Translator":
     st.markdown('<div class="section-title">🌍 AI Translator</div>', unsafe_allow_html=True)
-
     col1, col2 = st.columns([1, 1])
-
-    LANGUAGES = ["English", "Nepali", "Hindi", "Japanese", "Chinese", "Spanish", "French", "German",
-                 "Arabic", "Korean", "Portuguese", "Russian", "Italian", "Bengali", "Urdu", "Thai"]
+    LANGUAGES = ["English","Nepali","Hindi","Japanese","Chinese","Spanish","French","German","Arabic","Korean","Portuguese","Russian","Italian","Bengali","Urdu","Thai"]
 
     with col1:
         st.markdown(f'<div class="g-card">', unsafe_allow_html=True)
@@ -884,7 +881,6 @@ elif menu == "🌍 Translator":
                 prompt = f"Translate the following text from {src_lang} to {tgt_lang} in a {tone} tone. Only provide the translation.\n\n{text}"
                 with st.spinner("Translating..."):
                     result = groq_chat_no_stream(prompt, system="You are an expert multilingual translator.")
-
                 st.markdown(f'<div class="g-card">', unsafe_allow_html=True)
                 st.markdown(f"**Translation ({tgt_lang}):**")
                 st.write(result)
@@ -896,7 +892,6 @@ elif menu == "🌍 Translator":
 # =========================
 elif menu == "📝 Summarizer":
     st.markdown('<div class="section-title">📝 AI Summarizer</div>', unsafe_allow_html=True)
-
     col1, col2 = st.columns([1, 1])
 
     with col1:
@@ -914,7 +909,6 @@ elif menu == "📝 Summarizer":
                 prompt = f"Summarize the following text in {style} format, {length} length:\n\n{text}"
                 with st.spinner("Summarizing..."):
                     result = groq_chat_no_stream(prompt, system="You are an expert at summarizing content clearly and accurately.")
-
                 st.markdown(f'<div class="g-card">', unsafe_allow_html=True)
                 st.markdown(result)
                 st.markdown('</div>', unsafe_allow_html=True)
@@ -939,7 +933,6 @@ elif menu == "📝 Summarizer":
 # =========================
 elif menu == "🧹 Background Remover":
     st.markdown('<div class="section-title">🧹 AI Background Remover</div>', unsafe_allow_html=True)
-
     col1, col2 = st.columns([1, 1])
 
     with col1:
@@ -950,17 +943,15 @@ elif menu == "🧹 Background Remover":
 
     with col2:
         if img_file:
-            bg_color = st.color_picker("Replace background with color (optional)", "#000000")
             if st.button("✂️ Remove Background"):
                 with st.spinner("Removing background..."):
                     output = remove(image)
                 st.image(output, caption="Background Removed", use_column_width=True)
-
                 buf = io.BytesIO()
                 output.save(buf, format="PNG")
                 b64 = base64.b64encode(buf.getvalue()).decode()
                 st.markdown(
-                    f'<a href="data:image/png;base64,{b64}" download="guardian_nobg.png" style="display:inline-block;padding:8px 18px;background:linear-gradient(90deg,#6366f1,#8b5cf6);color:white;border-radius:8px;text-decoration:none;font-weight:600;margin-top:10px;">⬇️ Download PNG</a>',
+                    f'<a href="data:image/png;base64,{b64}" download="nobg.png" style="display:inline-block;padding:8px 18px;background:linear-gradient(90deg,#6366f1,#8b5cf6);color:white;border-radius:8px;text-decoration:none;font-weight:600;margin-top:10px;">⬇️ Download PNG</a>',
                     unsafe_allow_html=True
                 )
 
@@ -969,17 +960,16 @@ elif menu == "🧹 Background Remover":
 # =========================
 elif menu == "💻 Code Explainer":
     st.markdown('<div class="section-title">💻 Code Explainer & Reviewer</div>', unsafe_allow_html=True)
-
     col1, col2 = st.columns([1, 1])
 
     with col1:
         st.markdown(f'<div class="g-card">', unsafe_allow_html=True)
         code = st.text_area("Paste your code here", height=300, placeholder="# Paste any code here...")
-        lang = st.selectbox("Language", ["Python", "JavaScript", "TypeScript", "Java", "C++", "C", "Go", "Rust", "PHP", "HTML/CSS", "SQL", "Other"])
-        action = st.selectbox("What to do?", ["Explain line by line", "Find bugs", "Optimize", "Add comments", "Convert to another language", "Write unit tests"])
+        lang = st.selectbox("Language", ["Python","JavaScript","TypeScript","Java","C++","C","Go","Rust","PHP","HTML/CSS","SQL","Other"])
+        action = st.selectbox("What to do?", ["Explain line by line","Find bugs","Optimize","Add comments","Convert to another language","Write unit tests"])
         target_lang = ""
         if action == "Convert to another language":
-            target_lang = st.selectbox("Convert to", ["Python", "JavaScript", "Java", "C++", "Go"])
+            target_lang = st.selectbox("Convert to", ["Python","JavaScript","Java","C++","Go"])
         st.markdown('</div>', unsafe_allow_html=True)
 
     with col2:
@@ -991,12 +981,9 @@ elif menu == "💻 Code Explainer":
                     prompt = f"Convert this {lang} code to {target_lang}. Provide clean, working code with brief explanation:\n\n{code}"
                 else:
                     prompt = f"{action} this {lang} code. Be clear and technical:\n\n{code}"
-
-                system = "You are a senior software engineer. Provide expert, clear code analysis. Never execute or generate malicious code."
-
+                system = "You are a senior software engineer. Provide expert, clear code analysis. Never generate malicious code."
                 with st.spinner("Analyzing..."):
                     result = groq_chat_no_stream(prompt, system=system)
-
                 st.markdown(f'<div class="g-card">', unsafe_allow_html=True)
                 st.markdown(result)
                 st.markdown('</div>', unsafe_allow_html=True)
@@ -1007,17 +994,11 @@ elif menu == "💻 Code Explainer":
 # =========================
 elif menu == "😊 Mood Detector":
     st.markdown('<div class="section-title">😊 AI Mood Detector</div>', unsafe_allow_html=True)
-
-    st.markdown(f"""
-    <div class="g-card">
-        <div style="color:{T['sub']};font-size:0.85rem;">
-        Write anything — a journal entry, a message, how your day went — and Guardian will analyze your emotional state.
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown(f"""<div class="g-card"><div style="color:{T['sub']};font-size:0.85rem;">
+    Write anything — a journal entry, a message, how your day went — and Guardian will analyze your emotional state.
+    </div></div>""", unsafe_allow_html=True)
 
     text = st.text_area("✍️ Write your thoughts...", height=200)
-
     if st.button("🔍 Detect Mood"):
         if not text.strip():
             st.warning("Write something first.")
@@ -1025,17 +1006,15 @@ elif menu == "😊 Mood Detector":
             st.markdown(f'<div class="crisis-box">💙 I can sense you might be going through something heavy. {CRISIS_RESOURCES}</div>', unsafe_allow_html=True)
         else:
             prompt = f"""Analyze the emotional mood of this text. Provide:
-1. Primary emotion (e.g. Happy, Sad, Anxious, Excited, Angry, Calm, etc.)
+1. Primary emotion (Happy, Sad, Anxious, Excited, Angry, Calm, etc.)
 2. Intensity (Low / Medium / High)
 3. Tone analysis
 4. A supportive, friendly message based on the mood
 5. A suggestion or tip
 
 Text: {text}"""
-
             with st.spinner("Reading your vibes..."):
                 result = groq_chat_no_stream(prompt, system="You are an empathetic emotional intelligence AI. Be warm, insightful, and supportive.")
-
             st.markdown(f'<div class="g-card">', unsafe_allow_html=True)
             st.markdown(result)
             st.markdown('</div>', unsafe_allow_html=True)
@@ -1045,13 +1024,12 @@ Text: {text}"""
 # =========================
 elif menu == "✍️ Grammar Fixer":
     st.markdown('<div class="section-title">✍️ Grammar & Writing Fixer</div>', unsafe_allow_html=True)
-
     col1, col2 = st.columns([1, 1])
 
     with col1:
         st.markdown(f'<div class="g-card">', unsafe_allow_html=True)
         text = st.text_area("📝 Paste your text", height=250)
-        mode = st.selectbox("Mode", ["Fix Grammar", "Improve Style", "Make Formal", "Make Casual", "Make Concise", "Expand & Enrich", "Proofread & Critique"])
+        mode = st.selectbox("Mode", ["Fix Grammar","Improve Style","Make Formal","Make Casual","Make Concise","Expand & Enrich","Proofread & Critique"])
         st.markdown('</div>', unsafe_allow_html=True)
 
     with col2:
@@ -1062,95 +1040,60 @@ elif menu == "✍️ Grammar Fixer":
                 prompt = f"{mode} the following text. Show the corrected version and briefly explain key changes:\n\n{text}"
                 with st.spinner("Fixing..."):
                     result = groq_chat_no_stream(prompt, system="You are an expert editor and writing coach.")
-
                 st.markdown(f'<div class="g-card">', unsafe_allow_html=True)
                 st.markdown(result)
                 st.markdown('</div>', unsafe_allow_html=True)
                 st.markdown(get_download_link(result, "fixed_text.txt", "Download Fixed Text"), unsafe_allow_html=True)
 
 # =========================
-# 🖼️ IMAGE & URL ANALYZER  (FIXED + UPGRADED)
+# 🖼️ IMAGE & URL ANALYZER
 # =========================
 elif menu == "🖼️ Image & URL Analyzer":
     st.markdown('<div class="section-title">🖼️ Image & URL Analyzer</div>', unsafe_allow_html=True)
-
     tab1, tab2 = st.tabs(["🖼️ Image Caption", "🌐 URL / Link Analyzer"])
 
-    # ---- TAB 1: IMAGE CAPTION ----
     with tab1:
-        st.markdown(f"""
-        <div class="g-card">
-            <div style="color:{T['sub']};font-size:0.85rem;">
-            Upload any image and Guardian AI will generate a caption, description, alt text, and creative interpretation.
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown(f"""<div class="g-card"><div style="color:{T['sub']};font-size:0.85rem;">
+        Upload any image and Guardian AI will generate a caption, description, alt text, and creative interpretation.
+        </div></div>""", unsafe_allow_html=True)
 
-        img_file = st.file_uploader("Upload Image", type=["png", "jpg", "jpeg", "webp"], key="img_cap")
-
+        img_file = st.file_uploader("Upload Image", type=["png","jpg","jpeg","webp"], key="img_cap")
         if img_file:
             image = Image.open(img_file)
             st.image(image, caption="Uploaded Image", use_column_width=True)
-            style = st.selectbox("Caption Style", ["Descriptive", "Creative / Poetic", "Technical", "Social Media", "Funny"])
+            style = st.selectbox("Caption Style", ["Descriptive","Creative / Poetic","Technical","Social Media","Funny"])
 
             if st.button("✨ Generate Caption"):
                 buf = io.BytesIO()
                 image.save(buf, format="PNG")
                 img_b64 = base64.b64encode(buf.getvalue()).decode()
-
                 prompt = f"""Analyze this image carefully and provide ALL of the following:
-
 1. **{style} Caption** — A compelling caption in {style} style
 2. **Short Alt Text** — One sentence, accessibility-ready
 3. **Detailed Description** — What's in the image, colors, mood, setting, people/objects
 4. **Tags / Keywords** — 8-10 relevant hashtags or keywords
-5. **Creative Interpretation** — What story or emotion does this image tell?
-
-Be thorough and insightful."""
+5. **Creative Interpretation** — What story or emotion does this image tell?"""
 
                 try:
-                    res = client.chat.completions.create(
-                        model="llama-3.2-11b-vision-preview",
-                        messages=[{
-                            "role": "user",
-                            "content": [
-                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
-                                {"type": "text", "text": prompt}
-                            ]
-                        }],
-                        max_tokens=1000,
-                        stream=False
-                    )
-                    result = res.choices[0].message.content
+                    result = groq_vision_chat(prompt, img_b64)
                 except Exception as e:
-                    # Fallback: describe using text model
-                    result = groq_chat_no_stream(
-                        f"The user uploaded an image but the vision model is unavailable (error: {str(e)[:100]}). "
-                        f"Apologize briefly, explain vision model may not be available on their Groq plan, "
-                        f"and suggest they try llama-3.2-11b-vision-preview or check their API tier.",
-                        system="You are a helpful AI assistant."
-                    )
+                    result = f"⚠️ Vision model unavailable: {str(e)[:200]}\n\nPlease check your Groq plan supports `llama-3.2-11b-vision-preview`."
 
                 st.markdown(f'<div class="g-card">', unsafe_allow_html=True)
                 st.markdown(result)
                 st.markdown('</div>', unsafe_allow_html=True)
                 st.markdown(get_download_link(result, "image_caption.txt", "Download Caption"), unsafe_allow_html=True)
 
-    # ---- TAB 2: URL ANALYZER ----
     with tab2:
-        st.markdown(f"""
-        <div class="g-card">
+        st.markdown(f"""<div class="g-card">
             <div style="font-size:0.9rem;color:{T['text']};margin-bottom:8px;">🌐 <b>What can this analyze?</b></div>
             <div style="color:{T['sub']};font-size:0.82rem;line-height:1.8;">
-            • <b>YouTube links</b> — Detailed summary, key topics, suggested short clips, related content<br>
-            • <b>Portfolio / Personal sites</b> — Full review, ratings, strengths, improvement tips<br>
-            • <b>Any website / article</b> — Overview, key points, purpose, audience analysis
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+            • <b>YouTube links</b> — Summary, key topics, suggested clips<br>
+            • <b>Portfolio / Personal sites</b> — Full review, ratings, tips<br>
+            • <b>Any website / article</b> — Overview, key points, audience analysis
+            </div></div>""", unsafe_allow_html=True)
 
-        url_input = st.text_input("🔗 Paste any URL or link", placeholder="https://youtube.com/watch?v=... or https://yourportfolio.com")
-
+        url_input = st.text_input("🔗 Paste any URL", placeholder="https://youtube.com/watch?v=... or https://yourportfolio.com")
         analyze_mode = st.selectbox("Analysis Focus", [
             "Auto Detect (Smart)",
             "YouTube Video — Summary & Clips",
@@ -1161,25 +1104,19 @@ Be thorough and insightful."""
 
         if st.button("🔍 Analyze URL") and url_input.strip():
             url = url_input.strip()
-            
-            # Validate URL
             if not url.startswith(("http://", "https://")):
                 url = "https://" + url
 
             with st.spinner("Fetching and analyzing..."):
 
-                # ---- YOUTUBE ----
                 if is_youtube_url(url) or analyze_mode == "YouTube Video — Summary & Clips":
                     st.markdown(f'<span class="url-badge url-badge-yt">▶ YouTube Video</span>', unsafe_allow_html=True)
-                    
                     vid_info = fetch_youtube_info(url)
                     video_id = get_youtube_video_id(url)
-                    
                     col_a, col_b = st.columns([1, 2])
                     with col_a:
                         if video_id:
                             st.image(f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg", use_column_width=True)
-                    
                     with col_b:
                         st.markdown(f"**📺 Title:** {vid_info['title']}")
                         if vid_info['channel']:
@@ -1187,162 +1124,96 @@ Be thorough and insightful."""
                         if vid_info['description']:
                             st.markdown(f"**📝 Description preview:** {vid_info['description'][:300]}...")
 
-                    prompt = f"""You are analyzing a YouTube video. Here is all available metadata:
-
-Title: {vid_info['title']}
-Channel: {vid_info['channel']}
-Description: {vid_info['description'][:1000]}
-Keywords: {vid_info['keywords']}
-URL: {url}
-
-Provide a COMPLETE analysis with these exact sections:
+                    prompt = f"""Analyze a YouTube video with this metadata:
+Title: {vid_info['title']} | Channel: {vid_info['channel']}
+Description: {vid_info['description'][:1000]} | Keywords: {vid_info['keywords']} | URL: {url}
 
 ## 📋 Video Summary
-Write a detailed 4-6 sentence summary of what this video is likely about based on the title, description, and keywords.
+4-6 sentence summary based on title, description, and keywords.
 
 ## 🎯 Key Topics Covered
-List 6-8 main topics or points likely covered in this video.
+List 6-8 main topics likely covered.
 
 ## ✂️ Suggested Short Clip Moments
-Based on the title and description, suggest 4-5 timestamps/segments that would make great short clips or highlights. Format each as:
-- **[Suggested time range]** — Topic name: Why this would make a great clip
+4-5 timestamp segments that would make great clips. Format: **[Suggested time]** — Topic: Why it's great.
 
 ## 🔗 Related Content Suggestions
-Suggest 3-4 types of related videos the viewer should watch next (with search query suggestions for YouTube).
+3-4 types of related videos with YouTube search queries.
 
 ## 👥 Target Audience
-Who is this video for? Describe the ideal viewer.
+Who is this video for?
 
 ## ⭐ Content Quality Signals
-Based on title/description quality, estimate:
-- Production value signals (based on description detail)
-- SEO optimization (based on keywords/title)
-- Content depth (surface level vs deep dive)
-"""
+Production value, SEO optimization, content depth."""
 
                     result = groq_chat_no_stream(prompt, system="You are an expert YouTube content analyst and video strategist.")
-
                     st.markdown(f'<div class="g-card">', unsafe_allow_html=True)
                     st.markdown(result)
                     st.markdown('</div>', unsafe_allow_html=True)
                     st.markdown(get_download_link(result, "youtube_analysis.txt", "Download YouTube Analysis"), unsafe_allow_html=True)
 
-                # ---- PORTFOLIO / PERSONAL SITE ----
                 elif is_portfolio_url(url) or analyze_mode == "Portfolio / Personal Site — Review & Rating":
                     st.markdown(f'<span class="url-badge url-badge-portfolio">💼 Portfolio / Personal Site</span>', unsafe_allow_html=True)
-                    
                     site_data = fetch_website_content(url)
-
-                    st.markdown(f"""
-                    <div class="g-card" style="margin-bottom:16px;">
+                    st.markdown(f"""<div class="g-card" style="margin-bottom:16px;">
                         <div style="font-size:0.8rem;color:{T['sub']};font-family:'JetBrains Mono',monospace;margin-bottom:8px;">SITE METADATA</div>
                         <div><b>Title:</b> {site_data['title']}</div>
                         <div><b>Description:</b> {site_data['meta_desc'][:200] if site_data['meta_desc'] else 'Not found'}</div>
-                        <div style="margin-top:8px;"><b>Detected Tech/Features:</b> {', '.join(site_data['detected_tech']) if site_data['detected_tech'] else 'None detected'}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
+                        <div style="margin-top:8px;"><b>Detected Tech:</b> {', '.join(site_data['detected_tech']) if site_data['detected_tech'] else 'None detected'}</div>
+                    </div>""", unsafe_allow_html=True)
 
-                    prompt = f"""You are a senior UX designer and tech recruiter reviewing a portfolio/personal website.
-
-Website Data:
-- Title: {site_data['title']}
-- Meta Description: {site_data['meta_desc']}
-- Headings found: {', '.join(site_data['headings'][:10])}
-- Content snippets: {' | '.join(site_data['paragraphs'][:5])}
-- Detected technologies: {', '.join(site_data['detected_tech'])}
-- External links: {', '.join(site_data['links'][:5])}
-- URL: {url}
-
-Provide a COMPLETE professional portfolio review:
+                    prompt = f"""You are a senior UX designer and tech recruiter reviewing a portfolio.
+Title: {site_data['title']} | Meta: {site_data['meta_desc']}
+Headings: {', '.join(site_data['headings'][:10])} | Content: {' | '.join(site_data['paragraphs'][:5])}
+Tech: {', '.join(site_data['detected_tech'])} | Links: {', '.join(site_data['links'][:5])} | URL: {url}
 
 ## 👤 Overview
-What is this portfolio about? Who is the person? What do they do?
-
-## ✅ Strengths
-List 4-5 specific strengths of this portfolio based on the content.
-
-## ⚠️ Areas for Improvement  
-List 4-5 specific, actionable improvements.
-
-## 📊 Ratings (score out of 10 with explanation)
-- **Design & Visual Appeal:** X/10 — explanation
-- **Content & Clarity:** X/10 — explanation
-- **Technical Skill Showcase:** X/10 — explanation
-- **SEO & Discoverability:** X/10 — explanation
-- **Call-to-Action (Hire Me signals):** X/10 — explanation
+## ✅ Strengths (4-5 specific points)
+## ⚠️ Areas for Improvement (4-5 actionable points)
+## 📊 Ratings (X/10 with explanation)
+- **Design & Visual Appeal:** X/10
+- **Content & Clarity:** X/10
+- **Technical Skill Showcase:** X/10
+- **SEO & Discoverability:** X/10
+- **Call-to-Action (Hire Me signals):** X/10
 - **Overall Portfolio Score:** X/10
-
 ## 🚀 Top 3 Quick Wins
-The 3 most impactful changes they could make right now.
-
-## 💡 Standout Recommendation
-One specific, creative suggestion to make this portfolio memorable.
-"""
+## 💡 Standout Recommendation"""
 
                     result = groq_chat_no_stream(prompt, system="You are a world-class UX designer, hiring manager, and portfolio coach. Be specific, honest, and constructive.")
-
                     st.markdown(f'<div class="g-card">', unsafe_allow_html=True)
                     st.markdown(result)
                     st.markdown('</div>', unsafe_allow_html=True)
 
-                    # Extract ratings and show visual bars
                     rating_pattern = r'\*\*(.+?):\*\*\s*(\d+(?:\.\d+)?)/10'
                     ratings = re.findall(rating_pattern, result)
                     if ratings:
                         st.markdown(f'<div class="g-card"><div style="font-size:0.8rem;color:{T["sub"]};font-family:JetBrains Mono,monospace;margin-bottom:12px;">📊 VISUAL RATINGS</div>', unsafe_allow_html=True)
                         for label, score in ratings:
                             pct = float(score) * 10
-                            st.markdown(f"""
-                            <div class="rating-bar-wrap">
+                            st.markdown(f"""<div class="rating-bar-wrap">
                                 <div class="rating-bar-label">{label[:22]}</div>
-                                <div class="rating-bar-bg">
-                                    <div class="rating-bar-fill" style="width:{pct}%"></div>
-                                </div>
+                                <div class="rating-bar-bg"><div class="rating-bar-fill" style="width:{pct}%"></div></div>
                                 <div class="rating-score">{score}</div>
-                            </div>
-                            """, unsafe_allow_html=True)
+                            </div>""", unsafe_allow_html=True)
                         st.markdown('</div>', unsafe_allow_html=True)
-
                     st.markdown(get_download_link(result, "portfolio_review.txt", "Download Portfolio Review"), unsafe_allow_html=True)
 
-                # ---- GENERAL WEBSITE / ARTICLE ----
                 else:
                     st.markdown(f'<span class="url-badge url-badge-web">🌐 Website / Article</span>', unsafe_allow_html=True)
-
                     site_data = fetch_website_content(url)
+                    prompt = f"""Analyze this website/article:
+Title: {site_data['title']} | Meta: {site_data['meta_desc']}
+Headings: {', '.join(site_data['headings'][:10])} | Content: {' '.join(site_data['paragraphs'][:6])} | URL: {url}
 
-                    prompt = f"""Analyze this website/article comprehensively.
-
-Website Data:
-- Title: {site_data['title']}
-- Meta Description: {site_data['meta_desc']}
-- Main Headings: {', '.join(site_data['headings'][:10])}
-- Content: {' '.join(site_data['paragraphs'][:6])}
-- URL: {url}
-
-Provide:
-
-## 📋 Summary
-What is this page/site about? Write a clear 4-5 sentence overview.
-
-## 🎯 Key Points
-List the 6-8 most important points, ideas, or information from this content.
-
+## 📋 Summary (4-5 sentences)
+## 🎯 Key Points (6-8 most important)
 ## 👥 Target Audience
-Who is this content written for?
-
 ## 💡 Purpose & Intent
-What is the goal of this page — to inform, sell, educate, entertain?
-
-## 🔑 Key Takeaways
-3 things a reader should remember after visiting this page.
-
-## 📎 Related Topics to Explore
-4-5 related topics or searches this content connects to.
-"""
+## 🔑 Key Takeaways (3 things)
+## 📎 Related Topics to Explore (4-5)"""
 
                     result = groq_chat_no_stream(prompt, system="You are an expert web analyst and content strategist.")
-
                     st.markdown(f'<div class="g-card">', unsafe_allow_html=True)
                     st.markdown(f"**🌐 Site:** {site_data['title']}")
                     if site_data['meta_desc']:
@@ -1362,34 +1233,20 @@ elif menu == "📊 Session Stats":
 
     session_duration = str(datetime.datetime.now() - st.session_state.session_start).split(".")[0]
     total_msgs = len(st.session_state.chat_history)
-    user_msgs = len([m for m in st.session_state.chat_history if m["role"] == "user"])
-    ai_msgs = len([m for m in st.session_state.chat_history if m["role"] == "assistant"])
 
     st.markdown(f"""
     <div class="stat-row">
-        <div class="stat-card">
-            <div class="stat-num">{session_duration}</div>
-            <div class="stat-label">Session Time</div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-num">{st.session_state.total_queries}</div>
-            <div class="stat-label">Total Queries</div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-num">{total_msgs}</div>
-            <div class="stat-label">Messages</div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-num">{st.session_state.blocked_count}</div>
-            <div class="stat-label">Blocked</div>
-        </div>
+        <div class="stat-card"><div class="stat-num">{session_duration}</div><div class="stat-label">Session Time</div></div>
+        <div class="stat-card"><div class="stat-num">{st.session_state.total_queries}</div><div class="stat-label">Total Queries</div></div>
+        <div class="stat-card"><div class="stat-num">{total_msgs}</div><div class="stat-label">Messages</div></div>
+        <div class="stat-card"><div class="stat-num">{st.session_state.blocked_count}</div><div class="stat-label">Blocked</div></div>
     </div>
     """, unsafe_allow_html=True)
 
     st.markdown(f'<div class="g-card">', unsafe_allow_html=True)
     st.markdown(f"**🔐 Restrictions Status:** Active")
-    st.markdown(f"**🤖 Model:** LLaMA-3.1-8b-instant via Groq")
-    st.markdown(f"**🌐 API Base:** Groq OpenAI-compatible")
+    st.markdown(f"**🤖 Model:** LLaMA-3.1-8b-instant via Groq (no OpenAI SDK)")
+    st.markdown(f"**🌐 API Base:** {GROQ_BASE}")
     st.markdown(f"**🎨 Current Theme:** {theme_name}")
     st.markdown(f"**📅 Session Start:** {st.session_state.session_start.strftime('%H:%M %d %b %Y')}")
     st.markdown('</div>', unsafe_allow_html=True)
@@ -1398,23 +1255,19 @@ elif menu == "📊 Session Stats":
         st.markdown(f'<div class="section-title" style="margin-top:24px;">💬 Full Chat Log</div>', unsafe_allow_html=True)
         for msg in st.session_state.chat_history:
             role_icon = "👤" if msg["role"] == "user" else "⚔️"
-            st.markdown(f"""
-            <div class="chat-{'user' if msg['role'] == 'user' else 'ai'}">
+            st.markdown(f"""<div class="chat-{'user' if msg['role'] == 'user' else 'ai'}">
                 <div class="chat-label">{role_icon} {msg['role'].upper()} • {msg['time']}</div>
                 {msg['msg']}
-            </div>
-            """, unsafe_allow_html=True)
-
+            </div>""", unsafe_allow_html=True)
         chat_export = "\n\n".join([f"[{m['role'].upper()}] {m['time']}\n{m['msg']}" for m in st.session_state.chat_history])
-        st.markdown(get_download_link(chat_export, "guardian_full_log.txt", "Download Full Chat Log"), unsafe_allow_html=True)
+        st.markdown(get_download_link(chat_export, "dasa_full_log.txt", "Download Full Chat Log"), unsafe_allow_html=True)
 
 # =========================
 # FOOTER
 # =========================
 st.markdown(f"""
 <div class="footer">
-    ⚔️ GUARDIAN AI  v2.1 &nbsp;•&nbsp; BUILD IN DASA  &nbsp;•&nbsp;
-    Restrictions Active &nbsp;•&nbsp; Private Data Protected<br>
-    <span style="color:{T['accent']};">All systems operational</span>
+    ⚔️ GUARDIAN AI v2.1 &nbsp;•&nbsp; DASA STUDIO &nbsp;•&nbsp; Restrictions Active &nbsp;•&nbsp; Private Data Protected<br>
+    <span style="color:{T['accent']};">Powered by Groq API — No OpenAI SDK</span>
 </div>
 """, unsafe_allow_html=True)
